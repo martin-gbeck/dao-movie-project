@@ -101,5 +101,14 @@ A studio has, say, $300M to spend in a year. It can fund one $150M film plus thr
 | `movie_studio.ipynb`, `movie_studio.py` | The analysis, the same notebook in two formats, paired with jupytext |
 | `lib/` | Parsing, feature and schema code the notebook imports |
 | `data/README.md` | Every data file, its source link, units and traps |
-| `data/raw/` | The downloaded data, not in git |
+| `data/raw/` | The data as downloaded, 47 MB |
 | `docs/outline-2026-10-19.pdf` | The first outline, as sent to the group |
+| `requirements.txt` | The Python packages, at the versions the notebook was run with |
+
+## Running it
+
+You need Python 3.12. Install the packages, then open `movie_studio.ipynb` in Jupyter or VS Code with this folder as the working directory, since the notebook reads `data/raw/` and imports `lib/` by relative path.
+
+```bash
+pip install -r requirements.txt
+```
