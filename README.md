@@ -35,26 +35,28 @@ The 2.5 line is an assumption. The studio keeps about half of the box office, an
 - A film counts only if it is a feature film in IMDb, cost at least $1M at 2024 prices and took in at least $10,000 (19 Oct). TMDB holds user-entered junk such as budgets typed in millions.
 - Competition is the number of films released within 30 days, measured against that year's median (19 Oct), since the sources cover recent years far more completely.
 - A sequel is a film Wikidata numbers second or later in its series, a later film of a Wikidata series already in the table, a film TMDB tags as a sequel, or a title with "2", "III" or "Part Two" (19 Oct). Against TMDB's franchise lists it finds 77% of the sequels, and 71% of what it flags is a sequel there.
-- One model, proposed and waiting for a go: a regression on the log of the gross, with an error spread that depends on the budget. Its coefficients say how much each choice moves the box office, and its error spread gives the chance of a flop. The predictions feed a Monte Carlo simulation of film slates.
+- One model, a plain linear regression on the log of worldwide gross (19 Oct). Its coefficients say how much each choice moves the box office. A film's flop chance comes from its prediction plus the regression's errors on training films of the same budget tier, and the predictions feed a Monte Carlo simulation of film slates. The MPAA rating stays out, since whether the sources know it depends on how well-known the film became.
 
 ## Where it stands
 
-Data, split and exploration are done in `movie_studio.ipynb`. What the exploration found on `dev` (7,093 films), ranked by how much it should change the model:
+Data, exploration, model, test and the slate simulation are done in `movie_studio.ipynb`.
 
-1. A sequel is the strongest pre-release signal. Sequels flop 28-43% of the time against 64-74% for originals in the same budget tier, with a median multiple near 3 in every tier.
-2. Budget sets the risk more than the return. The spread of the log multiple falls from 1.95 under $25M to 0.79 above $150M, the only tier where fewer than half flop (47%). The model's error spread has to depend on the budget.
-3. Timing matters twice. June and July releases flop 55-58% of the time, September releases 74%, and for films under $150M the most crowded fifth of release windows adds 8-16 points to the flop share.
-4. Genre's effect depends on the budget. Animation and adventure pay off only at high budgets, horror only cheap; romance is middling in every tier.
-5. A strong record helps a little. A cast whose biggest draw averaged $300M or more flops 59% of the time against 73%, and a director whose earlier films rate 7 or more on IMDb 61% against 66-68%. Counting earlier films shows nothing.
-6. Independents flop 74% of the time and spread widest, partly because their budgets are small.
-7. Consumer sentiment shows nothing.
+The regression explains 58% of the variation in log box office on 2017-2019 films, against 46% for budget alone and 38% for each budget tier's median, and 60% on 2022-2023. Its flop chances are close to right, except that it rates big original films too risky (77% predicted against 64% actual). A typical film still lands a factor of about 3 above or below its prediction, so it ranks pitches and sizes risk rather than forecasting one film.
+
+What a studio should do, ranked:
+
+1. Make sequels where it can. A sequel roughly doubles the expected gross (+106%), and at $150M it cuts the predicted flop chance from 87% to 53%.
+2. Treat a big budget as insurance, not as return. Gross rises 2.16 times for each 2.7 times the money, so the multiple falls; the money buys a narrower range of outcomes.
+3. Pick the genre for the budget. Horror pays off cheap, animation only when expensive, comedy and family add 25-32% at any budget, war and history do worst.
+4. Release in July and avoid September (+22% and -18% against January).
+5. Pay for a proven record: +15% for each 2.7 times the cast's best earlier draw, +13% per point of the director's earlier rating.
+6. Build a slate of many cheap films around one sequel. The best simulated $300M slate earns a median $231M with a 14% chance of a losing year; tentpole-heavy slates earn at best $134M.
 
 ### Next
 
-1. Martin's go on the model.
-2. Fit it, check it on `test`, then the slate simulation.
-3. Book the presentation slot.
-4. Write the report and export the notebook as HTML.
+1. Book the presentation slot.
+2. Pick the report charts and write the report.
+3. Export the notebook as HTML for the submission.
 
 ## Hypotheses
 
@@ -67,7 +69,7 @@ What the exploration says, as of 19 Oct:
 5. Experienced, proven talent raises the return. Holds for the quality of the record, not its length (finding 5).
 6. Studios differ in what they earn and risk. Independents do worst, partly through budget (finding 6).
 7. Films do better when consumers feel good. Does not hold (finding 7).
-8. Big and small studios should pick different slates, because they can carry different amounts of risk. Comes from the slate simulation.
+8. Big and small studios should pick different slates, because they can carry different amounts of risk. Holds in this form: the best slate pairs one sequel with many cheap films, and a studio that skips big films altogether gives up about a sixth of the median profit.
 
 ## Charts, ranked
 

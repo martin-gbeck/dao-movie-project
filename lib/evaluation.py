@@ -1,4 +1,4 @@
-"""Scores for predictions of the log multiple and of the chance of a flop."""
+"""Scores for predictions of the log worldwide gross and of the chance of a flop."""
 
 from typing import cast
 
@@ -8,20 +8,23 @@ import polars as pl
 def score_predictions(
     predictions: pl.DataFrame, films: pl.DataFrame
 ) -> dict[str, float]:
-    """Mean absolute and root mean squared error of the log multiple, and the Brier score of the flop chance.
+    """Mean absolute and root mean squared error of the log gross, R², and the Brier score of the flop chance.
 
-    `predictions` needs film_id, predicted_log_multiple and flop_probability; `films` needs film_id,
-    log_multiple and flop. The Brier score is the mean of (flop chance - 1 if it flopped, else 0) squared.
+    `predictions` needs film_id, predicted_log_gross and flop_probability; `films` needs film_id, log_gross and
+    flop. R² is 1 - (squared error / squared distance from the films' own mean). The Brier score is the mean of
+    (flop chance - 1 if it flopped, else 0) squared.
     """
     scores = (
-        predictions.join(films.select("film_id", "log_multiple", "flop"), on="film_id")
+        predictions.join(films.select("film_id", "log_gross", "flop"), on="film_id")
         .select(
-            error=pl.col("predicted_log_multiple") - pl.col("log_multiple"),
+            error=pl.col("predicted_log_gross") - pl.col("log_gross"),
+            spread=pl.col("log_gross") - pl.col("log_gross").mean(),
             flop_miss=pl.col("flop_probability") - pl.col("flop").cast(pl.Float64),
         )
         .select(
-            mae_log_multiple=pl.col("error").abs().mean(),
-            rmse_log_multiple=pl.col("error").pow(2).mean().sqrt(),
+            mae_log_gross=pl.col("error").abs().mean(),
+            rmse_log_gross=pl.col("error").pow(2).mean().sqrt(),
+            r_squared=1 - pl.col("error").pow(2).sum() / pl.col("spread").pow(2).sum(),
             brier_flop=pl.col("flop_miss").pow(2).mean(),
         )
     )

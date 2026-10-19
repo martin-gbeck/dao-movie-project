@@ -34,6 +34,20 @@
 #     - 3.8 Studios
 #     - 3.9 Consumer mood
 #     - What the exploration found
+# - 4\. Cleaning and features
+#     - 4.1 Cleaning
+#     - 4.2 Hypotheses and features
+# - 5\. Modelling
+#     - 5.1 The regression against two yardsticks
+#     - 5.2 What the regression says
+# - 6\. Diagnostics
+# - 7\. Evaluation
+#     - What the test shows
+# - 8\. In practice
+#     - 8.1 Pitches
+#     - 8.2 Building a slate
+#     - 8.3 Does the break-even line matter?
+# - Conclusion
 
 # %% [markdown]
 # ## Objective
@@ -70,11 +84,13 @@ from plotnine import (
     geom_line,
     geom_linerange,
     geom_point,
+    geom_pointrange,
     geom_text,
     geom_tile,
     geom_violin,
     ggplot,
     labs,
+    scale_color_gradient,
     scale_color_identity,
     scale_color_manual,
     scale_fill_gradientn,
@@ -88,9 +104,12 @@ from plotnine import (
 )
 
 from lib.data_schemas import BREAK_EVEN_MULTIPLE, Film
+from lib.decision import simulate_slate_profit
+from lib.evaluation import score_predictions
 from lib.features import career_before_release, count_competitors
 from lib.fetching import fetch_wikidata_facts
 from lib.loading import load_franchise_lists, load_imdb, load_tmdb
+from lib.modeling import ReturnModel, fit_return_model, predict_returns
 from lib.parsing import attach_closest_year, fix_mojibake, major_studio, title_key
 
 RAW = Path("data/raw")
@@ -1262,3 +1281,701 @@ dev.drop_nulls("consumer_sentiment").with_columns(
 # 7. Consumer sentiment shows nothing and can be left out.
 #
 # To keep in mind: 47% of the money figures come from TMDB's user-entered data, 40% of films have no known MPAA rating, a film counts in each of its genres, the directors' earlier ratings are IMDb ratings as of October 2026, and every number here comes from `dev`, films from 1980 to 2016.
+
+# %% [markdown]
+# ## 4. Cleaning and features
+#
+# ### 4.1 Cleaning
+#
+# The floors in 1.2 already removed the entries that can only be errors, so no film is dropped here. Three inputs have gaps the regression cannot take as they are:
+#
+# - the director's earlier rating, missing for a director with no rated earlier film (24%)
+# - the cast's biggest earlier draw, missing for a cast with no earlier box office in the table (17%)
+# - the runtime, missing for 7 films
+#
+# Each gap gets the value from the training films (the mean rating, the median draw, the median runtime) and, for the first two, a flag that is 1 when the value was missing, so the regression can give first-timers their own effect. The fill values always come from the films a model is fitted on, never from the films it is scored on.
+#
+# Consumer sentiment (3.9) and the director's number of earlier films (3.7) showed no pattern and stay out.
+
+# %% [markdown]
+# ### 4.2 Hypotheses and features
+#
+# Each finding becomes a feature:
+#
+# | | Hypothesis | Feature |
+# |---|---|---|
+# | H1 | budget lowers the risk and raises the gross | `log_budget` |
+# | H2 | genre matters, and its effect depends on the budget | a flag per genre with at least 50 training films, plus `log_budget` × animation, adventure and horror |
+# | H3 | a known story is safer | `sequel`, `based_on_work` |
+# | H4 | the release date matters | release `month`, `crowding`, and `crowding` × `log_budget`, since crowding hurt only films under $150M |
+# | H5 | a proven record helps | `director_rating`, `director_no_rating`, `cast_draw`, `cast_no_history` |
+# | H6 | independents do worse | `independent` |
+#
+# `runtime_min` and `english` go in as content choices the studio also makes before filming. The MPAA rating stays out: it is unknown for 40% of films, and whether our sources know it depends on how well-known the film became, which is an outcome. In a first fit, an unknown rating came out at -59% on the gross, which is that leak, not a rating effect.
+#
+# `english` is kept as a control, but its effect is mostly about which films get into the data: non-English films appear in these sources mainly when they did well enough to be tracked internationally.
+#
+# Definitions:
+#
+# - `log_budget`: the natural log of the budget in 2024 USD millions, minus log(30), so 0 is a $30M film and +1 a film 2.7 times as expensive ($82M). Its coefficient is how much the gross rises per budget step of 2.7 times.
+# - `director_rating`: the director's earlier IMDb rating minus the training mean (6.5), so 0 is an average director and +1 one whose earlier films rate a point higher.
+# - `cast_draw`: the log of the cast's biggest earlier draw minus the training median, so +1 is a cast whose best earlier box office was 2.7 times the usual.
+#
+# Build the features for any set of films, with every fill value taken from `train`.
+
+# %%
+genre_flags = {
+    f"genre_{genre.lower().replace('-', '')}": genre
+    for genre in by_genre["genre"].to_list()
+}
+
+
+def prepare(frame: pl.DataFrame, train: pl.DataFrame) -> pl.DataFrame:
+    rating_mean = train["director_prior_rating"].mean()
+    draw_median = train["cast_best_log_gross"].median()
+    runtime_median = train["runtime_min"].median()
+    return frame.with_columns(
+        log_budget=pl.col("budget_real_musd").log() - np.log(30),
+        month=pl.col("release_date").dt.month(),
+        sequel=pl.col("sequel").cast(pl.Int8),
+        based_on_work=pl.col("based_on_work").cast(pl.Int8),
+        english=pl.col("english").cast(pl.Int8),
+        independent=(pl.col("major") == "Independent").cast(pl.Int8),
+        director_no_rating=pl.col("director_prior_rating").is_null().cast(pl.Int8),
+        director_rating=pl.col("director_prior_rating").fill_null(rating_mean)
+        - rating_mean,
+        cast_no_history=pl.col("cast_best_log_gross").is_null().cast(pl.Int8),
+        cast_draw=pl.col("cast_best_log_gross").fill_null(draw_median) - draw_median,
+        runtime_min=pl.col("runtime_min").fill_null(runtime_median),
+        **{
+            flag: pl.col("genres").str.contains(genre, literal=True).cast(pl.Int8)
+            for flag, genre in genre_flags.items()
+        },
+    )
+
+
+FORMULA = (
+    "log_gross ~ log_budget + sequel + based_on_work + "
+    + " + ".join(genre_flags)
+    + " + log_budget:genre_animation + log_budget:genre_adventure + log_budget:genre_horror"
+    + " + C(month) + crowding + crowding:log_budget"
+    + " + director_rating + director_no_rating + cast_draw + cast_no_history + independent"
+    + " + runtime_min + english"
+)
+dev = films.filter(pl.col("year") <= 2016)
+test = films.filter(pl.col("year").is_between(2017, 2019))
+reserve = films.filter(pl.col("year").is_between(2022, 2023))
+dev, test, reserve = (prepare(frame, dev) for frame in (dev, test, reserve))
+dev.select(
+    "log_budget", "crowding", "director_rating", "cast_draw", "runtime_min"
+).null_count()
+
+# %% [markdown]
+# Every feature is complete after the fills.
+
+# %% [markdown]
+# ## 5. Modelling
+#
+# ### 5.1 The regression against two yardsticks
+#
+# One model, an ordinary least squares regression of `log_gross` on the features in 4.2. Its errors also give each film's chance of a flop: a film's possible outcomes are its prediction plus each error the regression made on training films in the same budget tier, and the chance is the share of those outcomes below 2.5 times its budget. This keeps the actual shape of the errors, which differs by tier (cheap films have a long tail of near-total failures, big films do not), instead of assuming a bell curve.
+#
+# Two yardsticks it has to beat:
+#
+# - `budget only`: the same regression with `log_budget` as its one input, the 45% that 3.2 found budget alone explains
+# - `tier median`: every film gets its budget tier's median log gross and flop share from the training films, the rule a studio could read off the table in 3.3
+#
+# Validation follows time, as the split does. Three folds, each trained on every film released before its validation years: `fold-1` validates on 2005-2008, `fold-2` on 2009-2012, `fold-3` on 2013-2016. The exploration saw these years, so their scores run a little optimistic. Four scores:
+#
+# - `mae_log_gross`: mean absolute error of the log gross. At 0.9, a typical film lands a factor of e^0.9 = 2.5 above or below its prediction.
+# - `rmse_log_gross`: the same with squared errors, so big misses weigh more.
+# - `r_squared`: the share of the variation in log gross the predictions explain.
+# - `brier_flop`: the mean of (flop chance - outcome)², where the outcome is 1 for a flop and 0 otherwise. Always saying 50% scores 0.25; lower is better.
+#
+# Fit the regression and both yardsticks on each fold and score them on its validation years.
+
+# %%
+fold_years = {"fold-1": (2004, 2008), "fold-2": (2008, 2012), "fold-3": (2012, 2016)}
+fold_scores: list[dict[str, str | float]] = []
+fold_fits: dict[str, tuple[ReturnModel, pl.DataFrame]] = {}
+for fold, (last_train_year, last_validation_year) in fold_years.items():
+    raw_train = films.filter(pl.col("year") <= last_train_year)
+    fold_train = prepare(raw_train, raw_train)
+    fold_validation = prepare(
+        films.filter(
+            pl.col("year").is_between(last_train_year + 1, last_validation_year)
+        ),
+        raw_train,
+    )
+    model = fit_return_model(fold_train, FORMULA)
+    fold_fits[fold] = (model, fold_validation)
+    budget_only = fit_return_model(fold_train, "log_gross ~ log_budget")
+    tier_rule = fold_train.group_by("budget_tier").agg(
+        pl.col("log_gross").median().alias("predicted_log_gross"),
+        pl.col("flop").mean().alias("flop_probability"),
+    )
+    methods = {
+        "regression": predict_returns(model, fold_validation),
+        "budget only": predict_returns(budget_only, fold_validation),
+        "tier median": fold_validation.select("film_id", "budget_tier").join(
+            tier_rule, on="budget_tier"
+        ),
+    }
+    fold_scores += [
+        {
+            "fold": fold,
+            "method": method,
+            **score_predictions(predictions, fold_validation),
+        }
+        for method, predictions in methods.items()
+    ]
+
+cv_scores = pl.DataFrame(fold_scores)
+cv_scores
+
+# %% [markdown]
+# Average each method over the three folds, with the fold-to-fold standard deviation beside the two main scores.
+
+# %%
+cv_summary = (
+    cv_scores.group_by("method")
+    .agg(
+        pl.col("mae_log_gross").mean().alias("mae"),
+        pl.col("mae_log_gross").std().alias("mae_fold_sd"),
+        pl.col("r_squared").mean().alias("r_squared"),
+        pl.col("brier_flop").mean().alias("brier"),
+        pl.col("brier_flop").std().alias("brier_fold_sd"),
+    )
+    .sort("mae")
+)
+cv_summary
+
+# %% [markdown]
+# The regression wins on every score in every fold. Across the three folds it explains 56% of the variation in log gross, against 48% for budget alone and 36% for the tier median, and its typical error falls from 1.28 to 1.16 log units (a factor of 3.2 either way instead of 3.6). Its Brier score is 0.197 against 0.222 and 0.221, a gap about three times the fold-to-fold SD.
+#
+# A typical miss of a factor of 3 is still large: much of what decides a film's box office is not known before it is made.
+
+# %% [markdown]
+# ### 5.2 What the regression says
+#
+# Fit the regression on all of `dev`, the fit the test will score, and list each term's effect. `effect_pct` is exp(coefficient) - 1: at +20% the term raises the expected gross by a fifth with everything else held fixed. The interval is the 95% confidence interval on the same scale.
+
+# %%
+final_model = fit_return_model(dev, FORMULA)
+term_labels = {
+    "log_budget": "budget 2.7 times as large",
+    "sequel": "sequel",
+    "based_on_work": "adapts another work",
+    "crowding": "crowding +100%",
+    "crowding:log_budget": "crowding +100%, per budget step",
+    "director_rating": "director's earlier rating +1",
+    "director_no_rating": "director with no rated earlier film",
+    "cast_draw": "cast's best draw 2.7 times as large",
+    "cast_no_history": "cast with no box-office history",
+    "independent": "independent producer",
+    "runtime_min": "runtime +1 minute",
+    "english": "English-language",
+    "log_budget:genre_animation": "animation, per budget step",
+    "log_budget:genre_adventure": "adventure, per budget step",
+    "log_budget:genre_horror": "horror, per budget step",
+}
+confidence = final_model.fit.conf_int()
+effects = (
+    pl.DataFrame(
+        {
+            "term": final_model.fit.params.index.to_list(),
+            "coefficient": final_model.fit.params.to_numpy(),
+            "low": confidence[0].to_numpy(),
+            "high": confidence[1].to_numpy(),
+            "p_value": final_model.fit.pvalues.to_numpy(),
+        }
+    )
+    .filter(pl.col("term") != "Intercept")
+    .with_columns(
+        label=pl.col("term")
+        .replace(term_labels)
+        .str.replace(r"^genre_(\w+)$", "genre: ${1}")
+        .str.replace(r"^C\(month\)\[T\.(\d+)\]$", "month ${1} vs January"),
+        effect_pct=(pl.col("coefficient").exp() - 1) * 100,
+        low_pct=(pl.col("low").exp() - 1) * 100,
+        high_pct=(pl.col("high").exp() - 1) * 100,
+        clear=pl.when(pl.col("p_value") < 0.05)
+        .then(pl.lit("yes"))
+        .otherwise(pl.lit("no")),
+    )
+    .sort("effect_pct")
+)
+effects.select("label", "effect_pct", "low_pct", "high_pct", "p_value")
+
+# %% [markdown]
+# With everything else held fixed, a budget 2.7 times as large and being a sequel each roughly double the expected gross (+116% and +106%), and an independent producer cuts it by 65%. Then come genre (horror +36% at $30M, comedy +32%, war -50%), adapting another work (+29%), a July release (+22% against January, September -18%), the cast's biggest draw (+15% per 2.7 times) and the director's earlier rating (+13% per point). Crowding points the expected way (-18% per doubling) but is not clear of zero (p = 0.10).
+
+# %% [markdown]
+# Plot every effect with its interval. Blue terms are clear of zero at the 5% level, grey ones are not.
+
+# %%
+(
+    ggplot(
+        effects.with_columns(
+            pl.col("label").cast(
+                pl.Enum(effects["label"].unique(maintain_order=True).to_list())
+            )
+        ),
+        aes("label", "effect_pct"),
+    )
+    + geom_hline(yintercept=0, color=CONTEXT)
+    + geom_pointrange(aes(ymin="low_pct", ymax="high_pct", color="clear"), size=0.4)
+    + scale_color_manual(values={"yes": ACCENT, "no": CONTEXT})
+    + coord_flip()
+    + labs(
+        title="Budget and a sequel each double the expected gross",
+        x="",
+        y="change in expected worldwide gross, % (95% interval)",
+    )
+    + theme(figure_size=(9, 12), legend_position="none")
+)
+
+# %% [markdown]
+# A budget 2.7 times as large returns 2.16 times the gross, so the expected multiple falls by about a fifth with each step: what a bigger budget buys is the narrower range from 3.3, not a higher average return. The English-language effect (-41%) reflects which non-English films reach these sources (4.2) and is not advice to film in another language.
+
+# %% [markdown]
+# ## 6. Diagnostics
+#
+# Plot the final fit's errors against its predictions on `dev`.
+
+# %%
+dev_fit = (
+    predict_returns(final_model, dev)
+    .join(dev.select("film_id", "log_gross", "budget_tier"), on="film_id")
+    .with_columns(error=pl.col("log_gross") - pl.col("predicted_log_gross"))
+)
+
+(
+    ggplot(dev_fit, aes("predicted_log_gross", "error"))
+    + geom_point(color=ACCENT, alpha=0.25, size=0.8)
+    + geom_hline(yintercept=0, color=FLOP_RED)
+    + labs(
+        title="The errors centre on zero, with a long tail of films that did far worse than predicted",
+        x="predicted log worldwide gross",
+        y="actual minus predicted log gross",
+    )
+)
+
+# %% [markdown]
+# The errors sit around zero at every level of prediction with no curve left in them, but misses below the line run much further (to -7.3, about a thousandth of the predicted gross) than misses above it (to +5.4).
+
+# %% [markdown]
+# Show the spread of the errors per budget tier, which sets each film's range and flop chance, and how lopsided they are: the skew is 0 for a symmetric curve and negative when big misses fall below the prediction.
+
+# %%
+dev_fit.group_by("budget_tier").agg(
+    pl.len().alias("films"),
+    pl.col("error").std().alias("error_sd"),
+    pl.col("error").skew().alias("skew"),
+    (pl.col("error") < -2 * pl.col("error").std())
+    .mean()
+    .alias("below_minus_2_sd_share"),
+).sort("budget_tier")
+
+# %% [markdown]
+# The spread shrinks from 1.79 log units for films under $25M to 0.73 above $150M, and every tier leans left (skew -0.54 to -1.00): the regression's big misses are films that collapsed. That is why each film's range uses its own tier's errors rather than a bell curve.
+
+# %% [markdown]
+# Check that the flop chances mean what they say, on the three validation folds: films go into ten equal groups by predicted flop chance, and each group's average prediction is plotted against the share that actually flopped. Points on the diagonal are right.
+
+# %%
+calibration = (
+    pl.concat(
+        [
+            predict_returns(model, validation).join(
+                validation.select("film_id", "flop"), on="film_id"
+            )
+            for model, validation in fold_fits.values()
+        ]
+    )
+    .with_columns(
+        group=pl.col("flop_probability").qcut(
+            10, labels=[str(group) for group in range(10)], allow_duplicates=True
+        )
+    )
+    .group_by("group")
+    .agg(
+        pl.len().alias("films"),
+        pl.col("flop_probability").mean().alias("predicted_flop_share"),
+        pl.col("flop").mean().alias("actual_flop_share"),
+    )
+)
+
+(
+    ggplot(calibration, aes("predicted_flop_share", "actual_flop_share"))
+    + geom_abline(intercept=0, slope=1, color=CONTEXT)
+    + geom_point(aes(size="films"), color=ACCENT)
+    + scale_size(range=(3, 6))
+    + labs(
+        title="The flop chances are close to right, slightly too gloomy at the top",
+        x="predicted flop chance (group average)",
+        y="share of the group that flopped",
+    )
+    + theme(figure_size=(6, 5), legend_position="none")
+)
+
+# %% [markdown]
+# Seven of the ten groups sit within 3 points of the diagonal; the gloomiest tenth was predicted to flop 93% of the time and 86% did.
+
+# %% [markdown]
+# Check the flop chance where it matters most for a big studio, films of $150M or more, split by story type.
+
+# %%
+(
+    predict_returns(final_model, dev)
+    .join(
+        dev.select("film_id", "flop", "budget_tier", "sequel", "based_on_work"),
+        on="film_id",
+    )
+    .filter(pl.col("budget_tier") == "150M+")
+    .group_by("sequel", "based_on_work")
+    .agg(
+        pl.len().alias("films"),
+        pl.col("flop_probability").mean().alias("predicted_flop_share"),
+        pl.col("flop").mean().alias("actual_flop_share"),
+    )
+    .sort("sequel", "based_on_work")
+)
+
+# %% [markdown]
+# For films of $150M or more the chances are right for sequels (38% predicted against 35% actual, and 23% against 24% for sequels that adapt another work) and close for adaptations (68% against 63%), but too gloomy for big originals: 77% predicted against 64% actual, over 67 films. One budget slope for all films underrates the few big originals that get made, so 8.1 and 8.2 overstate their risk.
+
+# %% [markdown]
+# ## 7. Evaluation
+#
+# Score the final regression on `test`, films released 2017 to 2019, once, beside both yardsticks fitted on all of `dev` and the cross-validation averages from 5.1.
+
+# %%
+dev_tier_rule = dev.group_by("budget_tier").agg(
+    pl.col("log_gross").median().alias("predicted_log_gross"),
+    pl.col("flop").mean().alias("flop_probability"),
+)
+dev_budget_only = fit_return_model(dev, "log_gross ~ log_budget")
+
+
+def score_all(films_scored: pl.DataFrame) -> pl.DataFrame:
+    methods = {
+        "regression": predict_returns(final_model, films_scored),
+        "budget only": predict_returns(dev_budget_only, films_scored),
+        "tier median": films_scored.select("film_id", "budget_tier").join(
+            dev_tier_rule, on="budget_tier"
+        ),
+    }
+    return pl.DataFrame(
+        [
+            {"method": method, **score_predictions(predictions, films_scored)}
+            for method, predictions in methods.items()
+        ]
+    )
+
+
+test_scores = score_all(test).join(
+    cv_summary.select("method", cv_mae="mae", cv_brier="brier"), on="method"
+)
+test_scores
+
+# %% [markdown]
+# On 2017-2019 the regression explains 58% of the variation in log gross, against 46% for budget alone and 38% for the tier median, with a Brier score of 0.200 against 0.236 and 0.235. Both match cross-validation (56% and 0.197), so the model did not overfit the training years.
+
+# %% [markdown]
+# Score the 2022-2023 reserve the same way, as a check on the market after the pandemic.
+
+# %%
+score_all(reserve)
+
+# %% [markdown]
+# On 2022-2023 it explains 60% with a Brier score of 0.198, no worse than before the pandemic, though on only 233 films.
+
+# %% [markdown]
+# ### What the test shows
+#
+# 1. The regression beats both yardsticks on every score, and its test scores match cross-validation: 58% of the variation explained (56% in cross-validation) and a Brier score of 0.200 (0.197).
+# 2. It holds after the pandemic: 60% and 0.198 on 2022-2023.
+# 3. A typical film still lands a factor of about 3 above or below its prediction (mean absolute error 1.13 log units), so the model is for ranking pitches and sizing risk, not for forecasting one film's box office.
+
+# %% [markdown]
+# ## 8. In practice
+#
+# ### 8.1 Pitches
+#
+# A pitch is a film the studio could greenlight: a major studio, a director and cast with the median record of training films in the same budget tier (a $150M film usually comes with bigger names than a $10M one), typical crowding, a runtime of 110 minutes, in English, and a release month not yet chosen (the prediction is averaged over the twelve months). Its range is the regression's prediction plus each training error of its budget tier. Define the pitch types used here and in 8.2, and the typical talent per tier.
+
+# %%
+pitch_types = {
+    "original horror": {"genres": ["Horror", "Thriller"], "sequel": 0},
+    "original drama": {"genres": ["Drama"], "sequel": 0},
+    "romantic comedy": {"genres": ["Romance", "Comedy"], "sequel": 0},
+    "original action": {"genres": ["Action", "Adventure", "Sci-Fi"], "sequel": 0},
+    "action sequel": {"genres": ["Action", "Adventure", "Sci-Fi"], "sequel": 1},
+    "original animation": {"genres": ["Animation", "Adventure", "Comedy"], "sequel": 0},
+}
+
+
+tier_talent = {
+    str(row["budget_tier"]): row
+    for row in dev.group_by("budget_tier")
+    .agg(pl.col("director_rating").median(), pl.col("cast_draw").median())
+    .iter_rows(named=True)
+}
+
+
+def tier_of(budget_musd: float) -> str:
+    return tiers[sum(budget_musd >= edge for edge in (25, 75, 150))]
+
+
+def predict_pitch(pitch: str, budget_musd: float) -> dict[str, float | str]:
+    spec = pitch_types[pitch]
+    months = pl.DataFrame({"month": list(range(1, 13))}).with_columns(
+        film_id=pl.int_range(12),
+        budget_real_musd=pl.lit(float(budget_musd)),
+        budget_tier=pl.lit(tier_of(budget_musd)).cast(pl.Enum(tiers)),
+        log_budget=pl.lit(np.log(budget_musd) - np.log(30)),
+        sequel=pl.lit(spec["sequel"], dtype=pl.Int8),
+        based_on_work=pl.lit(0, dtype=pl.Int8),
+        crowding=pl.lit(1.0),
+        director_rating=pl.lit(
+            float(tier_talent[tier_of(budget_musd)]["director_rating"])
+        ),
+        director_no_rating=pl.lit(0, dtype=pl.Int8),
+        cast_draw=pl.lit(float(tier_talent[tier_of(budget_musd)]["cast_draw"])),
+        cast_no_history=pl.lit(0, dtype=pl.Int8),
+        independent=pl.lit(0, dtype=pl.Int8),
+        runtime_min=pl.lit(110),
+        english=pl.lit(1, dtype=pl.Int8),
+        **{
+            flag: pl.lit(int(genre in spec["genres"]), dtype=pl.Int8)
+            for flag, genre in genre_flags.items()
+        },
+    )
+    predicted = float(
+        np.mean(predict_returns(final_model, months)["predicted_log_gross"].to_numpy())
+    )
+    errors = final_model.tier_errors[tier_of(budget_musd)]
+    multiples = np.exp(predicted + errors) / budget_musd
+    return {
+        "pitch": pitch,
+        "budget_musd": float(budget_musd),
+        "predicted_log_gross": predicted,
+        "tier": tier_of(budget_musd),
+        "p10_multiple": float(np.quantile(multiples, 0.1)),
+        "median_multiple": float(np.median(multiples)),
+        "p90_multiple": float(np.quantile(multiples, 0.9)),
+        "flop_chance": float((multiples < BREAK_EVEN_MULTIPLE).mean()),
+    }
+
+
+pitches = pl.DataFrame(
+    [
+        predict_pitch("original horror", 10),
+        predict_pitch("romantic comedy", 40),
+        predict_pitch("original action", 150),
+        predict_pitch("action sequel", 150),
+    ]
+)
+pitches.drop("predicted_log_gross", "tier")
+
+# %% [markdown]
+# The $10M original horror has the highest median (3.4 times its budget), the widest range (0.2 to 20.5 times) and a 42% flop chance. The $150M action sequel reaches 2.3 times at the median with a 53% flop chance, while the same budget on an original flops 87% of the time; section 6 found the model too gloomy for big originals, so the true figure is likely nearer two in three.
+
+# %% [markdown]
+# Plot each pitch's likely range: the line runs from the multiple that one film in ten falls below to the one that one in ten beats, and the point is the median.
+
+# %%
+(
+    ggplot(
+        pitches.with_columns(
+            label=pl.format(
+                "{} at ${}M", pl.col("pitch"), pl.col("budget_musd").cast(pl.Int64)
+            )
+        ),
+        aes("label", "median_multiple"),
+    )
+    + geom_hline(yintercept=BREAK_EVEN_MULTIPLE, color=FLOP_RED)
+    + geom_linerange(
+        aes(ymin="p10_multiple", ymax="p90_multiple"), color=ACCENT, size=2
+    )
+    + geom_point(color="#0d366b", size=4)
+    + scale_y_log10(breaks=[0.1, 0.5, 1, 2.5, 5, 10, 20])
+    + coord_flip()
+    + labs(
+        title="A sequel turns a $150M bet from a likely loss into a coin flip",
+        x="",
+        y="worldwide gross / budget, 10th to 90th percentile (log scale), red line is break-even",
+    )
+    + theme(figure_size=(9, 3.8))
+)
+
+# %% [markdown]
+# The sequel's whole range sits above the original's: its worst 10% still takes in 1.1 times its budget, the original's 0.54 times.
+
+# %% [markdown]
+# ### 8.2 Building a slate
+#
+# A studio spends a yearly budget on several films, not one. Here it has $300M at 2024 prices, spent on pitch types from 8.1 at budgets the data covers for each, with at most one sequel a year, since a studio only has so many franchises to continue. Each film's profit for the studio is
+#
+# profit = 0.5 × gross - 1.25 × budget
+#
+# because the studio keeps half the box office and marketing costs another quarter of the budget, which puts break-even at the same 2.5 times the budget as the flop line. Films are drawn as independent of each other, which understates the risk of a bad year for the whole industry.
+#
+# Make 2,000 random slates that each spend between $250M and $300M, and simulate each one 2,000 times.
+
+# %%
+budget_options = {
+    "original horror": [5, 15, 40],
+    "original drama": [10, 30, 60],
+    "romantic comedy": [15, 40, 80],
+    "original action": [60, 120, 200],
+    "action sequel": [60, 120, 200],
+    "original animation": [60, 120, 200],
+}
+film_options = pl.DataFrame(
+    [
+        predict_pitch(pitch, budget)
+        for pitch, budgets in budget_options.items()
+        for budget in budgets
+    ]
+)
+option_budgets = film_options["budget_musd"].to_numpy()
+option_is_sequel = (film_options["pitch"] == "action sequel").to_numpy()
+
+rng = np.random.default_rng(2702)
+slate_rows: list[dict[str, float | int | str]] = []
+for slate_id in range(2000):
+    remaining = 300.0
+    chosen: list[int] = []
+    while True:
+        allowed = (option_budgets <= remaining) & ~(
+            option_is_sequel & any(option_is_sequel[chosen])
+        )
+        candidates = np.flatnonzero(allowed)
+        if len(candidates) == 0 or (remaining < 50 and rng.random() < 0.5):
+            break
+        pick = int(rng.choice(candidates))
+        chosen.append(pick)
+        remaining -= option_budgets[pick]
+    if remaining > 50:
+        continue
+    slate = film_options[chosen]
+    slate_budgets = slate["budget_musd"].to_numpy()
+    profit = simulate_slate_profit(
+        slate["predicted_log_gross"].to_numpy(),
+        slate["budget_musd"].to_numpy(),
+        [final_model.tier_errors[tier] for tier in slate["tier"]],
+        draws=2000,
+        rng=rng,
+    )
+    slate_rows.append(
+        {
+            "slate_id": slate_id,
+            "films": len(chosen),
+            "blockbuster_share": float(
+                slate_budgets[slate_budgets >= 120].sum() / slate_budgets.sum()
+            ),
+            "expected_profit_musd": float(profit.mean()),
+            "median_profit_musd": float(np.median(profit)),
+            "loss_chance": float((profit < 0).mean()),
+            "bad_year_profit_musd": float(np.quantile(profit, 0.05)),
+            "contents": ", ".join(
+                f"{row['pitch']} ${int(row['budget_musd'])}M"
+                for row in slate.iter_rows(named=True)
+            ),
+        }
+    )
+slates = pl.DataFrame(slate_rows)
+slates.height
+
+# %% [markdown]
+# Plot every slate's median profit against its profit in a bad year (the level that one in 20 simulated years falls below), coloured by how much of its budget goes to films of $120M or more. The median profit is used rather than the mean, because a few runaway hits in the simulation would otherwise make cheap, risky slates look best. Red marks the slates no other slate beats on both.
+
+# %%
+slates = slates.sort(
+    "bad_year_profit_musd", "median_profit_musd", descending=[True, True]
+).with_columns(
+    frontier=pl.col("median_profit_musd") >= pl.col("median_profit_musd").cum_max()
+)
+
+(
+    ggplot(slates, aes("bad_year_profit_musd", "median_profit_musd"))
+    + geom_point(aes(color="blockbuster_share"), alpha=0.6, size=1.5)
+    + geom_point(data=slates.filter(pl.col("frontier")), color=FLOP_RED, size=4)
+    + scale_color_gradient(low="#86b6ef", high="#0d366b")
+    + labs(
+        title="Slates heavy in $120M+ films earn less and lose more in a bad year",
+        x="profit in a bad year (1 in 20), USD millions",
+        y="median studio profit in a year, USD millions",
+        color="share of the budget in films of $120M+",
+    )
+)
+
+# %% [markdown]
+# Slates with no film of $120M or more have a median profit of $38M and lose $182M in a bad year, against -$27M and -$221M for slates with three quarters of the budget in such films. The two best slates (red) each pair one $120M sequel with eleven cheaper films: a median profit of $213M to $231M and a bad year of about -$90M.
+
+# %% [markdown]
+# Compare three strategies, each by its best slate: the best overall, the best with no film of $120M or more (what a small studio can afford), and the best with at least half the budget in films of $120M or more (the tentpole strategy).
+
+# %%
+strategies = {
+    "best overall": pl.lit(True),
+    "no film of $120M+": pl.col("blockbuster_share") == 0,
+    "half or more in $120M+ films": pl.col("blockbuster_share") >= 0.5,
+}
+picks = pl.concat(
+    [
+        slates.filter(rule)
+        .sort("median_profit_musd", descending=True)
+        .head(1)
+        .with_columns(strategy=pl.lit(name))
+        for name, rule in strategies.items()
+    ]
+)
+picks.select(
+    "strategy",
+    "films",
+    "median_profit_musd",
+    "loss_chance",
+    "bad_year_profit_musd",
+    "contents",
+)
+
+# %% [markdown]
+# The best slate overall earns a median $231M and loses money in 14% of simulated years. Without any film of $120M or more, the best earns $193M with an 18% chance of a loss, and a slate with half its budget or more in such films earns at best $134M with 28%. Every winner leans on $5M horror films, which the data rates highly partly because small films that failed outright are missing from the sources, so read the result as many cheap films plus one sequel, not as making only horror.
+#
+# H8 holds in this form: a studio that can afford one sequel should pair it with many cheap films, and a small studio gives up about a sixth of the median profit by skipping big films altogether.
+
+# %% [markdown]
+# ### 8.3 Does the break-even line matter?
+#
+# Count the flop share per budget tier in `dev` with break-even at 2, 2.5 and 3 times the budget.
+
+# %%
+dev.group_by("budget_tier").agg(
+    pl.len().alias("films"),
+    *[
+        (pl.col("gross_multiple") < line).mean().alias(f"flop_share_at_{line}")
+        for line in (2, 2.5, 3)
+    ],
+).sort("budget_tier")
+
+# %% [markdown]
+# At every line from 2 to 3 times the budget, films of $150M or more flop least (35% to 58%) while the three cheaper tiers sit close together (55% to 74%), so the budget result does not depend on where break-even is drawn.
+
+# %% [markdown]
+# ## Conclusion
+#
+# On this evidence, a studio choosing what to greenlight should rank its choices like this:
+#
+# 1. Make sequels where it can. A sequel roughly doubles the expected gross (+106%), and at $150M it cuts the predicted flop chance from 87% to 53%.
+# 2. Treat a big budget as insurance, not as return. Gross rises 2.16 times for each 2.7 times the money, so the multiple falls; what the money buys is a narrower range of outcomes.
+# 3. Pick the genre for the budget. Horror pays off cheap (+36% at $30M, falling 23% with each budget step), animation only when expensive (+16% per step), comedy and family add 25% to 32% at any budget, and war and history do worst.
+# 4. Release in July and avoid September: July adds 22% against January and September costs 18%. A doubling of the films released around the date costs about 18% more, though that figure is not clear of zero.
+# 5. Pay for a proven record: +15% for each 2.7 times the cast's best earlier draw, +13% per point of the director's earlier rating.
+# 6. Build a slate of many cheap films around one sequel rather than several tentpoles. The best simulated $300M slate earns a median $231M with a 14% chance of a losing year.
+#
+# The regression explains 58% of the variation in log box office on 2017-2019 films, against 46% for budget alone, and its flop chances are close to right except for big originals, which it rates too risky.
+#
+# Limitations: box office is not profit, and the 2.5 break-even line stands in for missing marketing and revenue-share data; 47% of budgets and grosses are user-entered on TMDB; small films that vanished are missing, which flatters cheap films and the slates built on them; the sequel flag misses about a quarter of sequels; and these are associations, since studios mostly make sequels of films that already worked.
