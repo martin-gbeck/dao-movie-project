@@ -10,28 +10,30 @@ BREAK_EVEN_MULTIPLE = 2.5
 
 class Film(pa.DataFrameModel):
     # fmt: off
-    film_id: int = pa.Field(ge=0, unique=True)                  # row id after duplicates are removed
-    title: str                                                  # title as in the course dataset, encoding fixed
-    title_key: str                                              # normalised title used to match sources
-    release_date: pl.Date                                       # first US release (The Numbers, else TMDB)
-    year: int = pa.Field(ge=1915, le=2017)                      # release year
-    budget_usd: float = pa.Field(gt=0)                          # production budget, nominal USD
-    budget_real_musd: float = pa.Field(gt=0)                    # production budget, USD millions at 2016 prices
-    worldwide_gross_usd: float = pa.Field(gt=0)                 # worldwide box office, nominal USD
-    worldwide_gross_real_musd: float = pa.Field(gt=0)           # worldwide box office, USD millions at 2016 prices
-    domestic_gross_usd: float = pa.Field(ge=0, nullable=True)   # US and Canada box office, nominal USD
-    gross_multiple: float = pa.Field(gt=0)                      # worldwide gross / budget
-    log_multiple: float                                         # natural log of gross_multiple
-    flop: bool                                                  # gross_multiple below BREAK_EVEN_MULTIPLE
-    genres: str                                                 # IMDb genres joined by "|", a film has several
-    content_rating: str = pa.Field(nullable=True)               # MPAA rating such as PG-13 or R
-    duration_min: int = pa.Field(gt=0)                          # runtime in minutes
-    country: str                                                # main production country
-    story_source: str = pa.Field(nullable=True)                 # original screenplay, book, comic, real events...
-    production_method: str = pa.Field(nullable=True)            # live action, animation...
-    studio: str                                                 # major parent studio among the producers, or Independent
-    director: str = pa.Field(nullable=True)                     # director name
-    actor_1: str = pa.Field(nullable=True)                      # first-billed actor
+    film_id: int = pa.Field(ge=0, unique=True)                     # row id
+    imdb_id: str = pa.Field(unique=True, str_startswith="tt")      # IMDb title id, the key to IMDb and Wikidata
+    title: str                                                     # title
+    release_date: pl.Date                                          # US release (The Numbers), else TMDB's date
+    year: int = pa.Field(ge=1980, le=2024)                         # release year
+    budget_usd: float = pa.Field(gt=0)                             # production budget, nominal USD
+    budget_real_musd: float = pa.Field(gt=0)                       # production budget, USD millions at 2024 prices
+    worldwide_gross_usd: float = pa.Field(ge=10_000)               # worldwide box office, nominal USD
+    worldwide_gross_real_musd: float = pa.Field(gt=0)              # worldwide box office, USD millions at 2024 prices
+    domestic_gross_usd: float = pa.Field(ge=0, nullable=True)      # US and Canada box office, nominal USD (The Numbers only)
+    log_gross: float                                               # natural log of worldwide_gross_real_musd: the target
+    gross_multiple: float = pa.Field(gt=0)                         # worldwide gross / budget
+    flop: bool                                                     # gross_multiple below BREAK_EVEN_MULTIPLE
+    genres: str = pa.Field(nullable=True)                          # IMDb genres joined by ",", up to three
+    runtime_min: int = pa.Field(gt=0, nullable=True)               # IMDb runtime in minutes
+    english: bool                                                  # original language is English
+    us_production: bool = pa.Field(nullable=True)                  # the United States is among the production countries
+    rating: str                                                    # MPAA rating: G, PG, PG-13, R, or Other (NC-17, not rated, unknown)
+    story_source: str = pa.Field(nullable=True)                    # The Numbers' story source: original screenplay, book, comic...
+    based_on_work: bool                                            # Wikidata or TMDB keywords say it adapts another work
+    series: str = pa.Field(nullable=True)                          # Wikidata film series, if any
+    sequel: bool                                                   # a later film in its series, or tagged as a sequel
+    major: str                                                     # major parent studio among producers and distributors, or Independent
+    money_source: str = pa.Field(isin=["The Numbers", "TMDB"])    # where budget and gross were taken from
     # fmt: on
 
     class Config(BaseConfig):  # ty: ignore[invalid-mutable-override]

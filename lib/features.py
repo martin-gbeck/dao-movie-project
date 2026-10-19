@@ -49,36 +49,34 @@ def count_competitors(
     )
 
 
-def prior_track_record(
-    films: pl.DataFrame, person_column: str, prefix: str
+def career_before_release(
+    people: pl.DataFrame, filmography: pl.DataFrame
 ) -> pl.DataFrame:
-    """Summarise each person's earlier films, using only films released before the one in the row.
+    """What each person on each film had done in earlier years, in the same role.
 
-    `films` needs film_id, release_date, log_multiple, flop and `person_column` (a director or actor name).
-    Returns one row per film with `<prefix>_prior_films`, `<prefix>_prior_median_log_multiple` and
-    `<prefix>_prior_flop_share`; the last two are null for a first film in the data.
+    `people` has one row per film and person: film_id, nconst, role, film_year. `filmography` has one row per
+    credit: nconst, role, credit_year, imdb_rating, imdb_votes, log_gross (null for films without box office
+    in the film table) and flop. Only credits from years before `film_year` count, so everything here was
+    public when the film was greenlit. Returns per film and person: prior_films (all earlier feature films),
+    prior_rating (mean IMDb rating of earlier films with at least 1,000 votes), prior_box_office_films,
+    prior_median_log_gross and prior_flop_share (over the earlier films with known box office).
     """
-    history = films.select(
-        pl.col(person_column),
-        pl.col("release_date").alias("earlier_date"),
-        pl.col("log_multiple").alias("earlier_log_multiple"),
-        pl.col("flop").alias("earlier_flop"),
-    ).drop_nulls(person_column)
-    record = (
-        films.select("film_id", "release_date", person_column)
-        .join(history, on=person_column, how="inner")
-        .filter(pl.col("earlier_date") < pl.col("release_date"))
-        .group_by("film_id")
-        .agg(
-            pl.len().alias(f"{prefix}_prior_films"),
-            pl.col("earlier_log_multiple")
-            .median()
-            .alias(f"{prefix}_prior_median_log_multiple"),
-            pl.col("earlier_flop").mean().alias(f"{prefix}_prior_flop_share"),
-        )
-    )
+    rated = pl.col("imdb_votes") >= 1_000
     return (
-        films.select("film_id")
-        .join(record, on="film_id", how="left")
-        .with_columns(pl.col(f"{prefix}_prior_films").fill_null(0))
+        people.join(filmography, on=["nconst", "role"], how="left")
+        .filter(pl.col("credit_year") < pl.col("film_year"))
+        .group_by("film_id", "nconst", "role")
+        .agg(
+            pl.len().alias("prior_films"),
+            pl.col("imdb_rating").filter(rated).mean().alias("prior_rating"),
+            pl.col("log_gross").count().alias("prior_box_office_films"),
+            pl.col("log_gross").median().alias("prior_median_log_gross"),
+            pl.col("flop").mean().alias("prior_flop_share"),
+        )
+        .join(
+            people.select("film_id", "nconst", "role"),
+            on=["film_id", "nconst", "role"],
+            how="right",
+        )
+        .with_columns(pl.col("prior_films", "prior_box_office_films").fill_null(0))
     )

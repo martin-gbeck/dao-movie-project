@@ -1,3 +1,10 @@
 figs/
 .DS_Store
 .movie_studio.synced
+# large raw downloads: the notebook reads their extracts in data/interim/ (see data/README.md)
+data/raw/imdb/
+data/raw/tmdb_full/
+data/raw/movies_dataset/
+data/raw/wikidata/film_facts_batches/
+data/raw/wikidata/film_series.csv
+data/raw/download.*
